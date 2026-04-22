@@ -1,0 +1,10 @@
+torch
+torchvision
+numpy
+pandas
+einops
+tables
+pyproj
+scikit-learn
+seaborn
+tqdm

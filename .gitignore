@@ -1,0 +1,19 @@
+# IDE / Editor
+.vscode/
+.DS_Store
+.idea
+.vscode-server
+__pycache__/
+.wget-hsts
+.cursor-server
+.windsurf-server
+
+.lightning_studio/
+.netrc
+dataset/
+wandb/
+settings/cache/
+utils.py
+data.py
+main.py
+

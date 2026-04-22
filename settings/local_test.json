@@ -1,0 +1,41 @@
+[
+    {
+        "save_name": "4square-test-v1",
+        "dataset": {
+            "train_traj_df": "./dataset/4square/4square.h5",
+            "test_traj_df": "./dataset/4square/4square.h5",
+            "poi_df": "./dataset/4square/4square.h5",
+            "poi_embed": "./dataset/4square/4square--poi-embed.npy"
+        },
+        "model": {
+            "embed_size": 512,
+            "d_model": 256, 
+            "rope_layer": 2
+        },
+        "finetune": {
+            "load": false,
+            "save": true,
+            "dataloader": {
+                "batch_size": 512, 
+                "num_workers": 0
+            },
+            "padder": {
+                "name": "tul",
+                "params": {
+                    "num_users": "null"
+                }
+            },
+            "config": {
+                "num_epoch": 100,
+                "patience": 5, 
+                "factor": 0.5,
+                "lr": 0.0001,
+                "weight_decay": 0.0001,
+                "focal_alpha": 0.25, 
+                "focal_gamma": 2.0, 
+                "ce_weight": 0.4,
+                "supcon_weight": 0.4
+            }
+        }
+    }
+]
