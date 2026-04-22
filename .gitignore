@@ -13,7 +13,3 @@ __pycache__/
 dataset/
 wandb/
 settings/cache/
-utils.py
-data.py
-main.py
-
