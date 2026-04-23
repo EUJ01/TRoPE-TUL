@@ -1,6 +1,6 @@
 [
     {
-        "save_name": "4square-test-v1",
+        "save_name": "4square-test-2",
         "dataset": {
             "train_traj_df": "./dataset/4square/4square.h5",
             "test_traj_df": "./dataset/4square/4square.h5",
@@ -16,7 +16,7 @@
             "load": false,
             "save": true,
             "dataloader": {
-                "batch_size": 512, 
+                "batch_size": 1024, 
                 "num_workers": 0
             },
             "padder": {
@@ -26,7 +26,7 @@
                 }
             },
             "config": {
-                "num_epoch": 100,
+                "num_epoch": 200,
                 "patience": 5, 
                 "factor": 0.5,
                 "lr": 0.0001,

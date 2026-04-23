@@ -46,7 +46,7 @@ def train_user_model(model, train_dataloader, val_dataloader, device, num_epoch,
         config = {"model": {}, "finetune": {"dataloader": {}, "config": {}}, "save_name": SAVE_NAME}
 
     run = wandb.init(
-        entity="SP_001",
+        # entity="SP_001",
         project="TRoPE-TUL",
         config={
             "summary": data_summary,

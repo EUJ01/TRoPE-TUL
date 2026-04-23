@@ -10,6 +10,8 @@ __pycache__/
 
 .lightning_studio/
 .netrc
-dataset/
+dataset/4square/4square--poi-embed.npy
+dataset/hd5_creator.ipynb
 wandb/
 settings/cache/
+saved_model/
