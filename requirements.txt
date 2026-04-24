@@ -8,3 +8,5 @@ pyproj
 scikit-learn
 seaborn
 tqdm
+wandb
+sentence_transformers
