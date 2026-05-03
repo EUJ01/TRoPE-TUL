@@ -1,7 +1,7 @@
 # TRoPE-TUL
 The pytorch implementation version of TRoPETUL
 
-The datasets are available at https://www.kaggle.com/datasets/ezharuddinjubaer/poi-enriched-gps-and-check-in-datasets
+The datasets are available at https://doi.org/10.34740/kaggle/dsv/15921592
 
 The hyperparameters can be set from settings/local_test.json
 
