@@ -1,7 +1,7 @@
 # TRoPE-TUL
 The pytorch implementation version of TRoPETUL
 
-The datasets are available at https://doi.org/10.34740/kaggle/dsv/15921592
+The datasets will be available at https://dx.doi.org/10.6084/m9.figshare.32165550
 
 The hyperparameters can be set from settings/local_test.json
 
