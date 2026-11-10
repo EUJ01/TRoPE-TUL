@@ -1,147 +1,99 @@
-import torch
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import Dataset
-from pyproj import Proj, transform
+from sklearn.model_selection import train_test_split
 
-TRAJ_ID_COL = 'traj_id'
-USER_COL = 'user_id'
-X_COL = 'lng'
-Y_COL = 'lat'
-T_COL = 'timestamp'
-DT_COL = 'delta_t'
+from geo import load_trips, project, TRAJ_ID_COL, USER_COL, X_COL, Y_COL, T_COL  # noqa: F401 (re-exported)
 
-ST_MAP = {
-    "spatial": [0, 1],
-    "temporal": [2, 3]
-}
+# Per-point input features: x, y (scaled UTM), day-of-week, hour, minute (local time),
+# minutes since the trajectory's first point.
+N_FEATS = 6
 
-FEATURE_TOKEN = 0
-FEATURE_PAD = 0
-PAD_TOKEN = 5
 
-def coord_transform_GPS_UTM(traj, UTM_region, origin_coord="latlong", dest_coord="utm"):
-    """Transforms GPS coordinates to UTM or vice-versa."""
-    if origin_coord == "latlong":
-        origin = Proj(proj="latlong", datum="WGS84")
-        dest = Proj(proj="utm", zone=UTM_region, datum="WGS84")
-    elif origin_coord == "utm":
-        dest = Proj(proj="latlong", datum="WGS84")
-        origin = Proj(proj="utm", zone=UTM_region, datum="WGS84")
-    else:
-        raise NotImplementedError(f"Coordinate type '{origin_coord}' not supported.")
+def make_split(traj_ids, users, seed):
+    """Stratified 80/10/10 split; draws the same ids as the released utils.stratify_dataset."""
+    idx = np.arange(len(traj_ids))
+    train, val_test = train_test_split(idx, test_size=0.2, stratify=users, random_state=seed)
+    # F14: users with one trajectory in val+test (GeoLife users 42, 64) crash the second split;
+    # they share one stratum. No such users on Foursquare/Gowalla, so their split is unchanged.
+    strata = users[val_test].copy()
+    vals, counts = np.unique(strata, return_counts=True)
+    rare = np.isin(strata, vals[counts < 2])
+    strata[rare] = -1
+    if rare.sum() == 1:
+        strata[rare] = vals[counts.argmax()]
+    val, test = train_test_split(val_test, test_size=0.5, stratify=strata, random_state=seed)
+    return {k: traj_ids[v].tolist() for k, v in (('train', train), ('val', val), ('test', test))}
 
-    # Apply transformation based on array dimensions
-    if traj.ndim == 2:
-        easting, northing = transform(origin, dest, traj[:, 0], traj[:, 1]) #type: ignore
-        traj[:, 0], traj[:, 1] = easting, northing
-    elif traj.ndim == 3:
-        easting, northing = transform(origin, dest, traj[:, :, 0], traj[:, :, 1]) #type: ignore
-        traj[:, :, 0], traj[:, :, 1] = easting, northing
-        
-    return traj
 
-class TRoPETULDataset(Dataset):
-    def __init__(self, traj_df, UTM_region, scale, spatial_middle_coord=None):
-        super().__init__()
-        self.traj_df = traj_df
-        self.UTM_region = UTM_region
-        self.scale = scale
-        self.traj_ids = self.traj_df[TRAJ_ID_COL].unique()
+def time_features(ts, tz):
+    """Day-of-week, hour and minute (fractional) in local time, from int64 Unix seconds."""
+    t = pd.to_datetime(ts, unit='s', utc=True).tz_convert(tz)
+    minute = np.asarray(t.minute + t.second / 60)
+    hour = np.asarray(t.hour) + minute / 60
+    dow = np.asarray(t.dayofweek) + hour / 24
+    return np.stack([dow, hour, minute], -1)
 
-        spatial_border = traj_df[[X_COL, Y_COL]]
-        self.spatial_border = [spatial_border.min().tolist(), spatial_border.max().tolist()]
-        
-        # Calculate or assign the middle coordinate
-        if spatial_middle_coord is None:
-            self.middle_coord = np.array([[(self.spatial_border[0][0] + self.spatial_border[1][0]) / 2, 
-                                           (self.spatial_border[0][1] + self.spatial_border[1][1]) / 2]])
-            self.spatial_middle_coord = coord_transform_GPS_UTM(self.middle_coord, self.UTM_region)
-        else:
-            self.spatial_middle_coord = spatial_middle_coord
 
-        # Transform and scale coordinates
-        traj_gps = traj_df[[X_COL, Y_COL]].values.copy()
-        traj_utm = (coord_transform_GPS_UTM(traj_gps, self.UTM_region) - self.spatial_middle_coord) / self.scale 
-        self.traj_df[[X_COL, Y_COL]] = pd.DataFrame(traj_utm)
+class TrajDataset(Dataset):
+    """One item per trajectory: (features (L, N_FEATS) float32, POI table rows (L,) or (L, 1 + levels) int64, user id)."""
+
+    def __init__(self, point_feats, ts, users, rows_by_traj, traj_ids, poi_index):
+        self.items = []
+        for t in traj_ids:
+            r = rows_by_traj[t]
+            r = r[np.argsort(ts[r], kind='stable')]
+            dt = ((ts[r] - ts[r[0]]) / 60).astype(np.float32)[:, None]
+            feats = np.concatenate([point_feats[r], dt], 1).astype(np.float32)
+            self.items.append((feats, poi_index[r].astype(np.int64), int(users[r[0]])))
 
     def __len__(self):
-        return self.traj_ids.shape[0]
+        return len(self.items)
 
-    def __getitem__(self, index):
-        one_traj = self.traj_df[self.traj_df[TRAJ_ID_COL] == self.traj_ids[index]].copy()
-        one_traj[DT_COL] = one_traj[T_COL] - one_traj[T_COL].iloc[0]
-        return one_traj
+    def __getitem__(self, i):
+        return self.items[i]
 
-class TULPadder:
-    """Collate function for Trajectory User Classification task.""" 
-    _current_row_indices = None  # Explicit declaration of the class variable
 
-    def __init__(self, num_users):
-        self.num_users = num_users
-    
-    def __call__(self, raw_batch):
-        input_batch, output_batch, pos_batch, row_indices_batch = [], [], [], []
-        
-        for traj in raw_batch:
-            traj_feats = traj[[X_COL, Y_COL, T_COL, DT_COL]].to_numpy()
-            user_id = traj[USER_COL].iloc[0] 
-            L_out = len(traj)
-            
-            # Extract original CSV row indices for POI embedding lookup
-            row_indices_batch.append(traj.index.values)
-            
-            # Build input sequence
-            input_row = np.stack([traj_feats, np.ones_like(traj_feats) * FEATURE_TOKEN], axis=-1)
-            input_batch.append(input_row)
-            
-            # Build output one-hot target
-            output_row = np.zeros((1, self.num_users))  
-            output_row[0, user_id] = 1  
-            output_batch.append(output_row)
-            
-            # Build position sequences
-            pos_batch.append(np.array([[i, 0] for i in range(L_out)]))
+def collate(batch):
+    """Pads to the longest trajectory. Returns feats, POI rows, pad mask (True = padding), users."""
+    B, L = len(batch), max(len(f) for f, _, _ in batch)
+    feats = np.zeros((B, L, N_FEATS), np.float32)
+    poi = np.zeros((B, L, *batch[0][1].shape[1:]), np.int64)  # (B, L) or (B, L, 1 + levels); pad 0
+    pad = np.ones((B, L), bool)
+    for i, (f, p, _) in enumerate(batch):
+        feats[i, :len(f)], poi[i, :len(f)], pad[i, :len(f)] = f, p, False
+    users = np.array([u for _, _, u in batch], np.int64)
+    return torch.from_numpy(feats), torch.from_numpy(poi), torch.from_numpy(pad), torch.from_numpy(users)
 
-        # Convert lists to padded tensors
-        input_batch = torch.tensor(pad_batch_3d(input_batch), dtype=torch.float32) 
-        output_batch = torch.tensor(np.array(output_batch), dtype=torch.float32).squeeze(1) 
-        pos_batch = torch.tensor(pad_batch_2d(pos_batch), dtype=torch.long)
-        
-        # Pad row_indices to match sequence length (B, L_max)
-        max_len = input_batch.size(1)
-        padded_row_indices = np.full((len(row_indices_batch), max_len), -1, dtype=np.int64)
-        for i, ri in enumerate(row_indices_batch):
-            padded_row_indices[i, :len(ri)] = ri
-            
-        # WARNING: This requires dataloader `num_workers=0` to work properly!
-        TULPadder._current_row_indices = torch.tensor(padded_row_indices, dtype=torch.long)
-        
-        return input_batch, output_batch, pos_batch
 
-def fetch_task_padder(padder_name, padder_params):
-    if padder_name == 'tul':
-        return TULPadder(**padder_params)
-    raise NotImplementedError(f"No Padder named '{padder_name}'")
+def cap_rows(rows_by_traj, ts, max_len):
+    """C5: each trajectory's first max_len rows in time order (stable, as TrajDataset sorts)."""
+    return {t: r[np.argsort(ts[r], kind='stable')][:max_len] for t, r in rows_by_traj.items()}
 
-def pad_batch_3d(batch):
-    max_len = max([arr.shape[0] for arr in batch])
-    padded_batch = np.stack((
-        np.full((len(batch), max_len, batch[0].shape[1]), FEATURE_PAD, dtype=float),
-        np.full((len(batch), max_len, batch[0].shape[1]), PAD_TOKEN, dtype=float)
-    ), axis=-1)
 
-    for i, arr in enumerate(batch):
-        padded_batch[i, :arr.shape[0]] = arr
-    return padded_batch
+class MPerUserSampler:
+    """C6 batch sampler: each user's trajectories are shuffled and cut into chunks of m (a user's last chunk may be
+    smaller); the chunks are shuffled and every batch takes batch_size // m of them. No replacement, an epoch is
+    exactly N items, at most batch_size // m users per batch; draws only from `generator`.
+    ponytail: short chunks make some batches smaller than batch_size (and a few more batches per epoch)."""
 
-def pad_batch_2d(batch):
-    max_len = max([arr.shape[0] for arr in batch])
-    padded_batch = np.stack((
-        np.full((len(batch), max_len), FEATURE_PAD, dtype=float),
-        np.full((len(batch), max_len), FEATURE_PAD, dtype=float)
-    ), axis=-1)
+    def __init__(self, users, m, batch_size, generator):
+        assert batch_size % m == 0, f"m {m} must divide the batch size {batch_size}"
+        users = np.asarray(users)
+        order = np.argsort(users, kind='stable')
+        self.by_user = np.split(order, np.cumsum(np.bincount(users))[:-1])
+        self.m, self.k, self.g = m, batch_size // m, generator
 
-    for i, arr in enumerate(batch):
-        padded_batch[i, :arr.shape[0]] = arr
-    return padded_batch
+    def __iter__(self):
+        chunks = []
+        for idx in self.by_user:
+            idx = idx[torch.randperm(len(idx), generator=self.g).numpy()]
+            chunks += [idx[i:i + self.m] for i in range(0, len(idx), self.m)]
+        order = torch.randperm(len(chunks), generator=self.g).tolist()
+        for s in range(0, len(order), self.k):
+            yield np.concatenate([chunks[c] for c in order[s:s + self.k]]).tolist()
+
+    def __len__(self):
+        n_chunks = sum(-(-len(i) // self.m) for i in self.by_user)
+        return -(-n_chunks // self.k)

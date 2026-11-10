@@ -3,9 +3,7 @@ import string
 import random
 from datetime import datetime
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_curve, average_precision_score
-from torch.utils.data import Subset
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -23,48 +21,6 @@ def get_random_string(length):
 def create_if_noexists(path):
     """ Safely create a directory if it doesn't exist. """
     os.makedirs(path, exist_ok=True)
-
-def stratify_dataset(dataset, test_size, random_seed):
-    """
-    Splits a dataset into train and test subsets while stratifying by user_id.
-    Optimized to prevent O(N^2) pandas dataframe lookups.
-    """
-    # If dataset is a Subset, unwrap it
-    if isinstance(dataset, Subset):
-        base_dataset = dataset.dataset
-        subset_indices = dataset.indices
-    else:
-        base_dataset = dataset
-        subset_indices = np.arange(len(dataset))
-
-    traj_ids = base_dataset.traj_ids #type: ignore
-    df = base_dataset.traj_df #type: ignore
-
-    # Only use traj_ids inside this subset
-    selected_traj_ids = traj_ids[subset_indices]
-
-    # OPTIMIZATION: Create a fast O(1) lookup dictionary mapping traj_id -> user_id
-    # This prevents scanning the entire dataframe repeatedly in a loop.
-    user_mapping = df.drop_duplicates(subset=['traj_id']).set_index('traj_id')['user_id'].to_dict()
-
-    user_array = np.array([user_mapping[tid] for tid in selected_traj_ids])
-    indices = np.arange(len(selected_traj_ids))
-
-    train_idx, test_idx = train_test_split(
-        indices,
-        test_size=test_size,
-        stratify=user_array,
-        random_state=random_seed
-    )
-
-    # Map back to original indices
-    train_indices = subset_indices[train_idx] #type: ignore
-    test_indices = subset_indices[test_idx] #type: ignore
-
-    train_dataset = Subset(base_dataset, train_indices) #type: ignore
-    test_dataset = Subset(base_dataset, test_indices) #type: ignore
-
-    return train_dataset, test_dataset
 
 # --------------------------------------------------
 # Visualization Functions
@@ -159,25 +115,14 @@ def save_confidence_histogram(all_probs, save_folder="histograms", filename="con
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-def get_user_labels(dataset):
-    """
-    Extracts user_id labels sequentially from the dataset.
-    Optimized to bypass slow pandas DataFrame building if unwrapping a subset.
-    """
-    # OPTIMIZATION: Same logic as stratify. If it's a massive dataset, 
-    # doing dataset[i] thousands of times is extremely slow.
-    if isinstance(dataset, Subset):
-        base_dataset = dataset.dataset
-        subset_indices = dataset.indices
-    else:
-        base_dataset = dataset
-        subset_indices = np.arange(len(dataset))
-
-    traj_ids = base_dataset.traj_ids #type: ignore
-    df = base_dataset.traj_df #type: ignore
-    
-    selected_traj_ids = traj_ids[subset_indices]
-    user_mapping = df.drop_duplicates(subset=['traj_id']).set_index('traj_id')['user_id'].to_dict()
-    
-    labels = [user_mapping[tid] for tid in selected_traj_ids]
-    return labels
+def compute_pr_curves(labels, probs):
+    """One-vs-rest PR curve and average precision per class (test set only)."""
+    pr_curves, avg_precisions = {}, {}
+    for i in range(probs.shape[1]):
+        y_true = (labels == i).astype(int)
+        if y_true.sum() > 0:
+            prec, rec, _ = precision_recall_curve(y_true, probs[:, i])
+            pr_curves[i], avg_precisions[i] = (prec, rec), average_precision_score(y_true, probs[:, i])
+        else:
+            pr_curves[i], avg_precisions[i] = (np.array([0.0]), np.array([0.0])), 0.0
+    return pr_curves, avg_precisions

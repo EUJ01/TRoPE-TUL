@@ -1,12 +1,10 @@
-torch
-torchvision
-numpy
-pandas
-einops
-tables
-pyproj
-scikit-learn
-seaborn
-tqdm
-wandb
-sentence_transformers
+# Versions the reported runs used (Python 3.13.2, CUDA build of torch).
+torch==2.8.0
+numpy==2.3.2
+pandas==3.0.3
+einops==0.8.2
+pyproj==3.8.0
+scikit-learn==1.7.1
+matplotlib==3.10.5
+seaborn==0.13.2
+wandb==0.30.0

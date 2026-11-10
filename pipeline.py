@@ -1,221 +1,173 @@
+import copy
 import os
-import json
+from itertools import combinations
 from time import time
+
 import numpy as np
 import pandas as pd
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from tqdm import trange, tqdm
-import wandb
-from sklearn.metrics import (
-    accuracy_score, 
-    confusion_matrix, 
-    precision_recall_curve, 
-    average_precision_score, 
-    precision_recall_fscore_support, 
-    matthews_corrcoef
-)
+from sklearn.metrics import precision_recall_fscore_support, matthews_corrcoef
 
-def train_user_model(model, train_dataloader, val_dataloader, device, num_epoch, lr, patience, factor, weight_decay, focal_alpha, focal_gamma, ce_weight, supcon_weight, data_summary, MODEL_CACHE_DIR, SAVE_NAME):
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=factor, patience=patience)
+def param_groups(model, weight_decay, wd_groups):
+    """F13: no weight decay on biases, norms, Fourier omega/bias and the rotary frequencies
+    (Wr, Wa; ST-RoPE log-omega and directions), and the cell embeddings."""
+    if not wd_groups:
+        return [{'params': model.parameters(), 'weight_decay': weight_decay}]
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        rotary = name.endswith(('.Wr.weight', '.Wa.weight', '_log_omega', '_alpha')) or 'cell_embed' in name
+        (no_decay if p.ndim < 2 or rotary else decay).append(p)
+    return [{'params': decay, 'weight_decay': weight_decay}, {'params': no_decay, 'weight_decay': 0.0}]
 
-    log = []
-    saved_model_state_dict = None
-    best_loss = float('inf')
-    start_epoch = 0
-    epochs_no_improve = 0
-    
-    # --- Checkpoint Resumption ---
-    checkpoint_path = os.path.join(MODEL_CACHE_DIR, f"{SAVE_NAME}.tul")
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        best_loss = checkpoint['best_loss']
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"📂 Resuming training from epoch {start_epoch}, best val_loss = {best_loss:.4f}")
-    
-    # --- WandB Initialization ---
-    try:
-        with open(os.path.join('settings', 'local_test.json'), 'r') as fp:
-            config = json.load(fp)[0]
-    except (FileNotFoundError, IndexError):
-        config = {"model": {}, "finetune": {"dataloader": {}, "config": {}}, "save_name": SAVE_NAME}
 
-    run = wandb.init(
-        # entity="SP_001",
-        project="TRoPE-TUL",
-        config={
-            "summary": data_summary,
-            "model": config.get("model", {}),
-            "dataloader": config.get("finetune", {}).get("dataloader", {}),
-            "config": config.get("finetune", {}).get("config", {}),
-        },
-        id=config.get("save_name", SAVE_NAME),
-        resume="allow"
-    )
-    print(f"🌐 WandB run id: {run.id}")
+def train_user_model(model, train_dataloader, val_dataloader, device, num_epoch, lr, patience, factor, weight_decay,
+                     ckpt_path, best_path, run=None, early_stop=15, clip=1.0, wd_groups=True, resume=False,
+                     epoch_hook=None):
+    """Selects on validation ACC@1. Writes best weights to best_path and a resume checkpoint to ckpt_path.
+    Returns (per-epoch log, best state dict); the model is left holding the best weights.
+    epoch_hook(model, epoch): called after each epoch's training pass, before validation (C4)."""
+    optimizer = torch.optim.AdamW(param_groups(model, weight_decay, wd_groups), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=factor, patience=patience)
 
-    # --- Training Loop ---
-    bar_desc = 'Training, avg loss: %.7f'
-    with trange(start_epoch, num_epoch, desc=bar_desc % 0.0) as bar:
-        for epoch_i in bar:
-            
-            loss_values = []
-            epoch_time = 0
-            model.train()
-            
-            for batch in tqdm(train_dataloader, desc='--> Training', leave=False):
-                input_tensor, output_tensor, pos_tensor = [t.to(device) for t in batch]
-                
-                optimizer.zero_grad()
-                s_time = time()
-                
-                loss = model.user_loss(input_tensor, output_tensor, pos_tensor)
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                
-                epoch_time += (time() - s_time)
-                loss_values.append(loss.item())
-            
-            loss_epoch = np.mean(loss_values)
-            bar.set_description(bar_desc % loss_epoch)
-            
-            # --- Validation ---
-            val_metrics, val_loss, _, _, _, _ = test_user_model(model, device, val_dataloader)
-            scheduler.step(val_loss)
+    log, best_acc, bad, start_epoch, best_state = [], -1.0, 0, 0, None
+    if resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck['model'])
+        optimizer.load_state_dict(ck['optimizer'])
+        scheduler.load_state_dict(ck['scheduler'])
+        log, best_acc, bad, start_epoch = ck['log'], ck['best_acc'], ck['bad'], ck['epoch'] + 1
+        best_state = torch.load(best_path, map_location=device)
+        print(f"Resuming from epoch {start_epoch + 1}, best val ACC@1 {best_acc * 100:.2f}")
 
-            print(f"\nEpoch {epoch_i + 1} | Val Loss: {val_loss:.6f}")
-            for key, value in val_metrics.items():
-                print(f"  - {key}: {value * 100:.2f}%")
-            
-            # --- Logging ---
-            log_entry = {
-                'epoch': epoch_i + 1, 
-                'time': epoch_time, 
-                'Train_Loss': loss_epoch, 
-                'Val_loss': val_loss
-            }
-            log_entry.update({k: round(v * 100, 2) for k, v in val_metrics.items()})
-            log.append(log_entry)
-            run.log(log_entry)
+    for epoch in range(start_epoch, num_epoch):
+        model.train()
+        t0, losses = time(), []
+        for batch in train_dataloader:
+            feats, poi, pad, users = [t.to(device) for t in batch]
+            optimizer.zero_grad()
+            loss, _ = model.user_loss(feats, poi, pad, users)
+            loss.backward()
+            if clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            optimizer.step()
+            losses.append(loss.item())
+        epoch_time = time() - t0
+        if epoch_hook is not None:
+            epoch_hook(model, epoch + 1)
 
-            # --- Model Saving & Early Stopping ---
-            if val_loss < best_loss:
-                best_loss = val_loss
-                epochs_no_improve = 0
-                saved_model_state_dict = model.state_dict()
-                
-                torch.save({
-                    'epoch': epoch_i,
-                    'model_state_dict': saved_model_state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'best_loss': best_loss
-                }, checkpoint_path)
-                print("🌟 New best model saved!")
-            else:
-                epochs_no_improve += 1
-                print(f"⚠️ No improvement for {epochs_no_improve} epoch(s).")
+        val_metrics, val_loss, _ = evaluate(model, device, val_dataloader)
+        acc = val_metrics['ACC@1']
+        scheduler.step(acc)
 
-            if epochs_no_improve >= 10:
-                print("\n🛑 Early stopping triggered. Training stopped.\n")
-                break
+        entry = {'epoch': epoch + 1, 'time': epoch_time, 'lr': optimizer.param_groups[0]['lr'],
+                 'Train_Loss': float(np.mean(losses)), 'Val_loss': val_loss,
+                 **{f'val_{k}': round(v * 100, 2) for k, v in val_metrics.items()}}
+        log.append(entry)
+        if run is not None:
+            run.log(entry)
 
-    # Wrap up logging
-    log_df = pd.DataFrame(log).set_index('epoch')
-    
-    if saved_model_state_dict is None and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        saved_model_state_dict = checkpoint['model_state_dict']
-        model.load_state_dict(saved_model_state_dict)
-    
-    return log_df, saved_model_state_dict
+        if acc > best_acc:
+            best_acc, bad = acc, 0
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save(best_state, best_path)
+        else:
+            bad += 1
+        print(f"Epoch {epoch + 1} | {epoch_time:.0f}s | loss {entry['Train_Loss']:.4f} | val loss {val_loss:.4f} "
+              f"| val ACC@1 {acc * 100:.2f} (best {best_acc * 100:.2f}, {bad} bad) | val F1 {val_metrics['Macro-F1'] * 100:.2f} | lr {entry['lr']:.2e}", flush=True)
+        torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(), 'log': log, 'best_acc': best_acc,
+                    'bad': bad, 'epoch': epoch}, ckpt_path)
+        if bad >= early_stop:
+            print(f"Early stop: no val ACC@1 gain for {early_stop} epochs")
+            break
+
+    model.load_state_dict(best_state)
+    return log, best_state
+
+
+def grad_share(model, loader, device, clip, seed, path, epoch):
+    """C4 (E5): per batch of a fixed loader (its generator re-seeded to `seed`, so the same batches every time), the
+    gradients of the unweighted CE / focal / SupCon terms w.r.t. the shared parameters (all but user_pred_layers) and
+    the pooled vector. Appends raw and weighted norms, pairwise cosines and whether the clip fires on the weighted sum
+    (all parameters, as clip_grad_norm_) to path. Never touches .grad or the optimizer; RNG state restored."""
+    names = ('ce', 'focal', 'supcon')
+    w = dict(zip(names, (model.ce_weight, model.focal_weight, model.supcon_weight)))
+    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    head = torch.cat([torch.full((p.numel(),), n.startswith('user_pred_layers'), dtype=torch.bool, device=p.device)
+                      for n, p in params])
+    rows = []
+    with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+        loader.generator.manual_seed(seed)
+        for b, batch in enumerate(loader):
+            feats, poi, pad, users = [t.to(device) for t in batch]
+            terms, _, pooled = model.loss_terms(feats, poi, pad, users)
+            g = {}
+            for k, t in zip(names, terms):
+                gs = torch.autograd.grad(t, [p for _, p in params] + [pooled], retain_graph=True, allow_unused=True)
+                flat = torch.cat([(x if x is not None else torch.zeros_like(p)).flatten() for x, (_, p) in zip(gs, params)])
+                g[k] = (flat, gs[-1].flatten())
+            row = {'epoch': epoch, 'batch': b, 'n': len(users)}
+            for k in names:
+                for i, part in enumerate(('shared', 'pooled')):
+                    v = g[k][0][~head] if i == 0 else g[k][1]
+                    row[f'{k}_{part}_norm'] = v.norm().item()
+                    row[f'{k}_{part}_wnorm'] = w[k] * row[f'{k}_{part}_norm']
+            for a, c in combinations(names, 2):
+                row[f'cos_{a}_{c}_shared'] = torch.cosine_similarity(g[a][0][~head], g[c][0][~head], 0).item()
+                row[f'cos_{a}_{c}_pooled'] = torch.cosine_similarity(g[a][1], g[c][1], 0).item()
+            row['total_norm'] = sum(w[k] * g[k][0] for k in names).norm().item()
+            row['clip_fires'] = bool(clip) and row['total_norm'] > clip
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    df.to_csv(path, mode='a', header=not os.path.exists(path), index=False)
+    m = df.mean(numeric_only=True)
+    print(f"Grad share epoch {epoch}: shared |g| weighted ce {m['ce_shared_wnorm']:.3g} focal {m['focal_shared_wnorm']:.3g} "
+          f"supcon {m['supcon_shared_wnorm']:.3g} | cos ce-focal {m['cos_ce_focal_shared']:.2f} ce-supcon "
+          f"{m['cos_ce_supcon_shared']:.2f} focal-supcon {m['cos_focal_supcon_shared']:.2f} | clip fires "
+          f"{df['clip_fires'].mean() * 100:.0f}%", flush=True)
 
 
 @torch.no_grad()
-def test_user_model(model, device, dataloader):
-    """Evaluates the model and computes global metrics directly to save redundant forward passes."""
+def evaluate(model, device, dataloader):
+    """Whole-set metrics in one forward pass per batch. Returns (metrics, mean batch loss, (labels, logits))."""
     model.eval()
-    
-    loss_values = []
-    all_preds, all_labels, all_probs = [], [], []
-    
-    for batch in tqdm(dataloader, desc='Testing/Validating', leave=False):
-        input_tensor, output_tensor, pos_tensor = [t.to(device) for t in batch]
+    losses, labels, logits = [], [], []
+    for batch in dataloader:
+        feats, poi, pad, users = [t.to(device) for t in batch]
+        loss, out = model.user_loss(feats, poi, pad, users)
+        losses.append(loss.item())
+        labels.append(users.cpu())
+        logits.append(out.float().cpu())
+    labels, logits = torch.cat(labels).numpy(), torch.cat(logits).numpy()
+    return compute_metrics(labels, logits), float(np.mean(losses)), (labels, logits)
 
-        # 1. Compute Loss
-        loss = model.user_loss(input_tensor, output_tensor, pos_tensor)
-        loss_values.append(loss.item())
 
-        # 2. Extract Logits & Probs
-        _, mem_seq = model(input_tensor, pos_tensor[:, :input_tensor.size(1)])
-        logits = model.pred(mem_seq) 
-        probs = torch.softmax(logits, dim=1)
+def save_preds(path, split, val_out, test_out):
+    """Per split: labels, fp32 logits, trajectory ids, top-5 (best first, [:, 0] == argmax).
+    y_true and top5 repeat the test split for code/competing/score_pred.py."""
+    z = {}
+    for k, (labels, logits) in (('val', val_out), ('test', test_out)):
+        logits = np.asarray(logits, np.float32)
+        z.update({f'{k}_labels': np.asarray(labels, np.int64), f'{k}_logits': logits, f'{k}_traj': np.array(split[k]),
+                  f'{k}_top5': np.argsort(-logits, axis=1, kind='stable')[:, :5]})
+    z['y_true'], z['top5'] = z['test_labels'], z['test_top5']
+    np.savez_compressed(path, **z)
 
-        # 3. Store Batch Results
-        all_labels.extend(torch.argmax(output_tensor, dim=1).cpu().numpy())
-        all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
 
-    # --- Compute Global Metrics ---
-    all_labels = np.array(all_labels)
-    all_preds = np.array(all_preds)
-    all_probs = np.array(all_probs)
-    
-    loss_epoch = np.mean(loss_values)
-    conf_mat = confusion_matrix(all_labels, all_preds)
-
-    # Standard Metrics
-    acc_1 = accuracy_score(all_labels, all_preds)
-    
-    # ACC@5 logic:
-    top5_preds = np.argsort(all_probs, axis=1)[:, -5:]
-    acc_5 = np.mean([1 if all_labels[i] in top5_preds[i] else 0 for i in range(len(all_labels))])
-
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='macro', zero_division=0) #type: ignore
-    mcc = matthews_corrcoef(all_labels, all_preds)
-
-    total_metrics = {
-        'ACC@1': acc_1,
-        'ACC@5': acc_5,
-        'Macro-P': precision,
-        'Macro-R': recall,
-        'Macro-F1': f1,
-        'MCC': mcc,
+def compute_metrics(labels, logits):
+    """F12: every metric over the whole set; macro averages over all classes (labels=0..C-1)."""
+    n_classes = logits.shape[1]
+    preds = logits.argmax(1)
+    top5 = np.argpartition(-logits, min(5, n_classes) - 1, axis=1)[:, :5]
+    p, r, f1, _ = precision_recall_fscore_support(labels, preds, labels=np.arange(n_classes),
+                                                  average='macro', zero_division=0)
+    return {
+        'ACC@1': float((preds == labels).mean()),
+        'ACC@5': float((top5 == labels[:, None]).any(1).mean()),
+        'Macro-P': float(p),
+        'Macro-R': float(r),
+        'Macro-F1': float(f1),
+        'MCC': float(matthews_corrcoef(labels, preds)),
     }
-
-    # PR Curves & Average Precision (One-vs-Rest)
-    n_classes = all_probs.shape[1]
-    pr_curves, avg_precisions = {}, {}
-    
-    for i in range(n_classes):
-        y_true_bin = (all_labels == i).astype(int)
-        y_score = all_probs[:, i]
-        
-        # Handle edge cases where a class is entirely missing from the validation split
-        if y_true_bin.sum() > 0:
-            prec, rec, _ = precision_recall_curve(y_true_bin, y_score)
-            ap = average_precision_score(y_true_bin, y_score)
-        else:
-            prec, rec, ap = np.array([0.0]), np.array([0.0]), 0.0
-            
-        pr_curves[i] = (prec, rec)
-        avg_precisions[i] = ap
-
-    return total_metrics, loss_epoch, conf_mat, pr_curves, avg_precisions, all_probs
-
-
-def pad_batch_arrays(arrs):
-    """Pad a batch of arrays with representing feature sequences of different lengths."""
-    max_len = max(a.shape[1] for a in arrs)
-    arrs = [
-        np.concatenate([a, np.repeat(a[:, -1:], repeats=max_len-a.shape[1], axis=1)], axis=1)
-        for a in arrs
-    ]
-    return np.concatenate(arrs, 0)

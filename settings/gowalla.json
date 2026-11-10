@@ -1,0 +1,60 @@
+{
+  "save_name": "gowalla_v2_tune_loc1_cell4_m2_d03",
+  "dataset": {
+    "trips": "gowalla-Texas-TrajTRoPE.csv",
+    "poi_embed": "pois/gowalla-Texas-poi-embed.npy",
+    "split": "splits/gowalla_seed42.json",
+    "utm_zone": 14,
+    "tz": "America/Chicago",
+    "bbox": [
+      -106.65,
+      25.84,
+      -93.51,
+      36.5
+    ]
+  },
+  "model": {
+    "embed_size": 1024,
+    "d_model": 256,
+    "rope_layer": 4,
+    "token_embed": false,
+    "pool_mask": true,
+    "rope": {
+      "type": "trajfm",
+      "causal": false
+    },
+    "cell_embed": {
+      "levels": [
+        10,
+        50,
+        200,
+        1000
+      ],
+      "dim": 64,
+      "max_rows": 65536,
+      "min_traj": 2,
+      "drop_fine": 0.3
+    }
+  },
+  "finetune": {
+    "dataloader": {
+      "batch_size": 64,
+      "num_workers": 0
+    },
+    "config": {
+      "num_epoch": 300,
+      "early_stop": 15,
+      "patience": 5,
+      "factor": 0.5,
+      "lr": 0.0001,
+      "weight_decay": 0.001,
+      "clip": 1.0,
+      "wd_groups": true,
+      "focal_alpha": 0.25,
+      "focal_gamma": 2.0,
+      "ce_weight": 0.4,
+      "supcon_weight": 0.4,
+      "focal_weight": 0.0
+    }
+  }
+}

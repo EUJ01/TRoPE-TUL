@@ -1,0 +1,62 @@
+{
+  "save_name": "tky_u1000_v2_tune_loc3d_bs16",
+  "dataset": {
+    "trips": "tky-scale-u1000-TrajTRoPE.csv",
+    "poi_embed": "pois/gemma/tky-scale-osm-qwen3-4b-2560.npy",
+    "split": "splits/tky_scale_u1000_seed42.json",
+    "utm_zone": 54,
+    "tz": "Asia/Tokyo",
+    "bbox": [
+      139.0,
+      35.0,
+      140.5,
+      36.3
+    ],
+    "poi_index": "pois/gemma/tky-scale-u1000-osm-poi-index.npy"
+  },
+  "model": {
+    "embed_size": 512,
+    "d_model": 256,
+    "rope_layer": 2,
+    "token_embed": false,
+    "pool_mask": true,
+    "rope": {
+      "type": "trajfm",
+      "causal": false
+    },
+    "cell_embed": {
+      "levels": [
+        10,
+        50,
+        200,
+        1000
+      ],
+      "dim": 64,
+      "max_rows": 65536,
+      "min_traj": 2,
+      "drop_fine": 0.3
+    },
+    "poi_drop": 0.3
+  },
+  "finetune": {
+    "dataloader": {
+      "batch_size": 16,
+      "num_workers": 0
+    },
+    "config": {
+      "num_epoch": 300,
+      "early_stop": 15,
+      "patience": 5,
+      "factor": 0.5,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "clip": 1.0,
+      "wd_groups": true,
+      "focal_alpha": 0.25,
+      "focal_gamma": 2.0,
+      "ce_weight": 0.4,
+      "supcon_weight": 0.4,
+      "focal_weight": 0
+    }
+  }
+}
