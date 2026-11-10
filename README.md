@@ -16,7 +16,13 @@ The reported runs used Python 3.13, PyTorch 2.8 with CUDA, and one NVIDIA L40S G
 
 ## Data
 
-The processed data are at https://dx.doi.org/10.6084/m9.figshare.32165550. Put the files in `dataset/` so that the paths in `settings/*.json` resolve:
+The files needed to run the model are at https://dx.doi.org/10.6084/m9.figshare.32165550:
+
+- `TRoPE-TUL-trajectories-splits.zip`: unzip it in the repository root; it creates `dataset/` with the trajectories, the splits and the Foursquare-TKY POI index files.
+- `4square--poi-embed.npy`, `gowalla-Texas-poi-embed.npy` and `geolife-Beijing-poi-embed--v2-fp16.npy`: put them in `dataset/pois/`.
+- `tky-scale-osm-qwen3-4b-2560.npy`: put it in `dataset/pois/gemma/`.
+
+The same item also holds the POI data of Foursquare, Gowalla and GeoLife (`*-POIs.csv`), which the POI vectors were computed from. The resulting layout, as the paths in `settings/*.json` expect:
 
 ```
 dataset/
