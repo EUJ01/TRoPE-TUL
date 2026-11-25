@@ -99,7 +99,7 @@ class TRoPETUL(UserLoss, nn.Module):
                  dropout=0.1, ff_dim=256, nhead=8, supcon_temp=0.1, head_dropout=0.0, seq_dropout=0.0,
                  cell_embed=None, fourier_xy=None, poi_drop=0.0, poi_gate=False, poi_gate_cell=False, seq_arch='rope', xy_token=True):
         super().__init__()
-        assert seq_arch in ('rope', 'bilstm'), seq_arch
+        assert seq_arch in ('rope', 'bilstm', 'none'), seq_arch
         assert 0 <= poi_drop < 1, 'poi_drop must be in [0, 1)'
         assert poi_table is not None or not (poi_drop or poi_gate), 'poi_drop / poi_gate need the POI token (model.poi true)'
         assert not poi_gate_cell or (poi_table is not None and cell_embed), 'poi_gate_cell needs the POI and cell tokens'
@@ -156,10 +156,14 @@ class TRoPETUL(UserLoss, nn.Module):
         self.causal = True if rope is None else rope.get('causal', True)
         # seq_arch 'bilstm' (2026-11-07, E3 same-input control, R1.2 / R1.5): every input, the mixer, positions and the
         # pooling stay; only the rotary encoder becomes a BiLSTM (rope_layer layers, d_model // 2 per direction, packed).
+        # seq_arch 'none' (2026-11-15, E16, R1.10): no RoPE encoder at all, as the first version's "w/o STRPE" ablation
+        # (mem_seq = modal_h): the mixer's per-point vectors go straight to the pooling; nothing attends across points.
         self.seq_arch = seq_arch
         if seq_arch == 'bilstm':
             self.seq_model = nn.LSTM(d_model, d_model // 2, num_layers=rope_layer, batch_first=True, bidirectional=True,
                                      dropout=seq_dropout if rope_layer > 1 else 0.0)
+        elif seq_arch == 'none':
+            self.seq_model = None
         else:
             self.seq_model = RoPE_Encoder(d_model, layers=rope_layer, rope=rope, dropout=seq_dropout)
 
@@ -201,6 +205,8 @@ class TRoPETUL(UserLoss, nn.Module):
     def forward(self, feats, poi_idx, pad):
         causal_mask = gen_causal_mask(feats.size(1)).to(feats.device) if self.causal else None
         modal_h = self.cal_modal_h(feats, poi_idx, pad)
+        if self.seq_arch == 'none':
+            return modal_h
         if self.seq_arch == 'bilstm':  # packed: padding never enters the recurrence
             packed = pack_padded_sequence(modal_h, (~pad).sum(1).cpu(), batch_first=True, enforce_sorted=False)
             return pad_packed_sequence(self.seq_model(packed)[0], batch_first=True, total_length=modal_h.size(1))[0]
